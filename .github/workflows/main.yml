@@ -1,4 +1,4 @@
-name: 🚀 VPS Ubuntu Podstawowy z Tailscale
+name: 🚀 VPS Debian z Tailscale
 
 on:
   workflow_dispatch:
@@ -6,59 +6,63 @@ on:
       username:
         description: 'Nazwa użytkownika'
         required: false
-        default: 'ubuntu'
+        default: 'debian'
       ssh_port:
         description: 'Port SSH'
         required: false
         default: '22'
 
 jobs:
-  setup-ubuntu-vps:
-    runs-on: ubuntu-24.04
+  setup-debian-vps:
+    runs-on: debian-12  # Debian 12 Bookworm
     timeout-minutes: 3600
 
     steps:
-      - name: 🔥 TOTALNY RESET PAKIETÓW
+      - name: 🔥 Czyszczenie systemu
         run: |
-          # Zabij wszystkie procesy menedżera pakietów
+          # Zatrzymaj wszystkie procesy menedżera pakietów
           sudo killall -9 apt apt-get dpkg 2>/dev/null || true
           sudo rm -f /var/lib/dpkg/lock-frontend
           sudo rm -f /var/lib/dpkg/lock
           sudo rm -f /var/cache/apt/archives/lock
           
-          # Naprawa dpkg
+          # Przygotowanie systemu
           sudo dpkg --configure -a
-          sudo apt-get update --fix-missing
-          
-          # Wymuś instalację podstawowych pakietów bez zależności
-          sudo apt-get install -y --fix-broken
-          
-          # Minimalna aktualizacja
           sudo apt-get update
+          sudo apt-get upgrade -y
 
-      - name: 📦 Instalacja TYLKO niezbędnych pakietów
+      - name: 📦 Instalacja podstawowych narzędzi
         run: |
-          # Instalujemy tylko to co naprawdę potrzebne
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get install -y \
             openssh-server \
             curl \
             wget \
             git \
             ufw \
             sudo \
-            ca-certificates
+            ca-certificates \
+            gnupg \
+            lsb-release \
+            htop \
+            neofetch
 
       - name: 🔧 Konfiguracja SSH
         run: |
-          # Prosta konfiguracja SSH
+          # Backup konfiguracji
+          sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+          
+          # Konfiguracja SSH
           sudo sed -i 's/#Port 22/Port ${{ github.event.inputs.ssh_port }}/' /etc/ssh/sshd_config
           sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+          
+          # Restart SSH
           sudo systemctl restart sshd
 
       - name: 👤 Tworzenie użytkownika
         run: |
           USERNAME="${{ github.event.inputs.username }}"
-          PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c12)
+          PASSWORD=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c16)
           
           # Tworzenie użytkownika
           sudo useradd -m -s /bin/bash -G sudo $USERNAME 2>/dev/null || sudo useradd -m -s /bin/bash $USERNAME
@@ -68,68 +72,122 @@ jobs:
           echo "VPS_USERNAME=$USERNAME" >> $GITHUB_ENV
           echo "VPS_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
-      - name: 🔑 Generowanie klucza SSH
+      - name: 🔑 Generowanie kluczy SSH
         run: |
           USERNAME="${{ github.event.inputs.username }}"
           
+          # Tworzenie katalogu .ssh
           sudo mkdir -p /home/$USERNAME/.ssh
-          sudo ssh-keygen -t rsa -b 2048 -f /home/$USERNAME/.ssh/id_rsa -N "" -q
-          sudo cp /home/$USERNAME/.ssh/id_rsa.pub /home/$USERNAME/.ssh/authorized_keys
+          sudo chmod 700 /home/$USERNAME/.ssh
+          
+          # Generowanie kluczy (RSA i ED25519)
+          sudo ssh-keygen -t rsa -b 4096 -f /home/$USERNAME/.ssh/id_rsa -N "" -q
+          sudo ssh-keygen -t ed25519 -f /home/$USERNAME/.ssh/id_ed25519 -N "" -q
+          
+          # Autoryzacja
+          sudo cat /home/$USERNAME/.ssh/id_rsa.pub > /home/$USERNAME/.ssh/authorized_keys
+          sudo cat /home/$USERNAME/.ssh/id_ed25519.pub >> /home/$USERNAME/.ssh/authorized_keys
           sudo chmod 600 /home/$USERNAME/.ssh/authorized_keys
           sudo chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh
 
-      - name: 🔥 Podstawowy firewall
+      - name: 🔥 Konfiguracja firewalla
         run: |
-          # Minimalny firewall
-          sudo ufw --force enable || true
-          sudo ufw allow ${{ github.event.inputs.ssh_port }}/tcp || true
+          # Reset UFW
+          sudo ufw --force reset || true
+          
+          # Podstawowe reguły
+          sudo ufw default deny incoming
+          sudo ufw default allow outgoing
+          sudo ufw allow ${{ github.event.inputs.ssh_port }}/tcp
+          
+          # Włącz UFW
+          echo "y" | sudo ufw enable
+          sudo ufw status verbose
 
-      - name: 📦 Instalacja Tailscale (najważniejsze)
+      - name: 📁 Tworzenie struktury katalogów
         run: |
-          # Instalacja Tailscale (to jest najważniejsze)
+          USERNAME="${{ github.event.inputs.username }}"
+          
+          sudo mkdir -p /var/www/html
+          sudo mkdir -p /opt/scripts
+          sudo mkdir -p /backups
+          sudo chown -R $USERNAME:$USERNAME /var/www /opt /backups 2>/dev/null || true
+
+      - name: 📦 Instalacja Tailscale
+        run: |
+          # Instalacja Tailscale na Debian
           curl -fsSL https://tailscale.com/install.sh | sh
           
           # Podłączenie do Tailscale
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-            --hostname=ubuntu-vps-${{ github.run_id }} || true
+            --hostname=debian-vps-${{ github.run_id }} \
+            --accept-routes=false \
+            --accept-dns=false
           
           # Czekaj na IP
-          for i in {1..10}; do
+          for i in {1..15}; do
             TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "")
             if [ -n "$TAILSCALE_IP" ]; then
               echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+              echo "✅ Tailscale IP: $TAILSCALE_IP"
               break
             fi
+            echo "Oczekiwanie na Tailscale IP... ($i/15)"
             sleep 3
           done
 
       - name: 📋 Wyświetl dane dostępowe
         run: |
-          echo "=========================================="
-          echo "  🚀 VPS GOTOWY PRZEZ TAILSCALE  "
-          echo "=========================================="
+          PUBLIC_IP=$(curl -s ifconfig.me || echo "Nieznany")
+          
+          echo "================================================"
+          echo "    🚀 DEBIAN 12 Z TAILSCALE GOTOWY           "
+          echo "================================================"
           echo ""
+          echo "📌 DANE SERWERA:"
+          echo "──────────────────"
+          echo "🖥️  System: Debian 12 (Bookworm)"
           echo "🔗 Tailscale IP: ${{ env.TAILSCALE_IP }}"
-          echo "👤 Użytkownik: ${{ env.VPS_USERNAME }}"
-          echo "🔑 Hasło: ${{ env.VPS_PASSWORD }}"
-          echo "🔌 Port SSH: ${{ github.event.inputs.ssh_port }}"
+          echo "🌐 Publiczny IP: $PUBLIC_IP"
           echo ""
-          echo "📡 POŁĄCZENIE:"
-          echo "ssh ${{ env.VPS_USERNAME }}@${{ env.TAILSCALE_IP }} -p ${{ github.event.inputs.ssh_port }}"
+          echo "👤 DANE UŻYTKOWNIKA:"
+          echo "──────────────────"
+          echo "Użytkownik: ${{ env.VPS_USERNAME }}"
+          echo "Hasło: ${{ env.VPS_PASSWORD }}"
+          echo "Port SSH: ${{ github.event.inputs.ssh_port }}"
           echo ""
-          echo "🔑 KLUCZ PRYWATNY:"
+          echo "🔧 KOMENDY DO POŁĄCZENIA:"
+          echo "──────────────────"
+          echo "📡 PRZEZ TAILSCALE:"
+          echo "   ssh ${{ env.VPS_USERNAME }}@${{ env.TAILSCALE_IP }} -p ${{ github.event.inputs.ssh_port }}"
+          echo ""
+          echo "🔑 KLUCZE PRYWATNE SSH:"
+          echo "────────────────────────"
+          echo "🔐 KLUCZ RSA:"
           echo "------------------"
           sudo cat /home/${{ env.VPS_USERNAME }}/.ssh/id_rsa
           echo ""
-          echo "=========================================="
+          echo "🔐 KLUCZ ED25519 (nowszy):"
+          echo "------------------"
+          sudo cat /home/${{ env.VPS_USERNAME }}/.ssh/id_ed25519
+          echo ""
+          echo "================================================"
+          echo "✅ Debian aktywny przez 60 godzin!"
+          echo "================================================"
 
       - name: 🔄 Utrzymywanie połączenia
         run: |
-          echo "⏳ VPS aktywny przez 60 godzin"
+          echo "⏳ Debian VPS aktywny przez 60 godzin"
           echo ""
+          
           while true; do
-            echo "[$(date)] ✅ VPS | Tailscale: ${{ env.TAILSCALE_IP }}"
-            echo "   ssh ${{ env.VPS_USERNAME }}@${{ env.TAILSCALE_IP }} -p ${{ github.event.inputs.ssh_port }}"
+            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "${{ env.TAILSCALE_IP }}")
+            UPTIME=$(uptime | awk '{print $3}' | tr -d ',')
+            
+            echo "[$(date)] ✅ Debian 12 | Uptime: $UPTIME"
+            echo "   Tailscale: $TAILSCALE_IP"
+            echo "   ssh ${{ env.VPS_USERNAME }}@$TAILSCALE_IP -p ${{ github.event.inputs.ssh_port }}"
+            echo "   Hasło: ${{ env.VPS_PASSWORD }}"
             echo "   ---"
             sleep 300
           done
