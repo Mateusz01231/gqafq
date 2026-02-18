@@ -14,27 +14,34 @@ on:
 
 jobs:
   setup-ubuntu-vps:
-    runs-on: ubuntu-24.04  # Najnowsze Ubuntu 24.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 3600
 
     steps:
-      - name: 📦 Aktualizacja systemu
+      - name: 📦 Naprawa i aktualizacja systemu
         run: |
+          # Naprawa potencjalnych problemów z pakietami
+          sudo dpkg --configure -a
+          sudo apt-get update --fix-missing
+          sudo apt-get install -f -y
+          
+          # Aktualizacja systemu
           sudo apt-get update
-          sudo apt-get upgrade -y
-          sudo apt-get autoremove -y
+          sudo apt-get upgrade -y --allow-downgrades
+          sudo apt-get dist-upgrade -y
+          sudo apt-get autoremove -y --purge
+          sudo apt-get autoclean -y
 
-      - name: 📦 Instalacja podstawowych narzędzi
+      - name: 📦 Instalacja podstawowych narzędzi (part 1)
         run: |
+          # Instalacja w mniejszych partiach, żeby uniknąć konfliktów
           sudo apt-get install -y \
             openssh-server \
-            curl wget git htop neofetch \
-            ufw fail2ban \
-            docker.io docker-compose \
-            nodejs npm \
-            nginx \
-            certbot python3-certbot-nginx \
-            build-essential \
+            curl \
+            wget \
+            git \
+            htop \
+            neofetch \
             net-tools \
             software-properties-common \
             apt-transport-https \
@@ -42,11 +49,51 @@ jobs:
             gnupg \
             lsb-release \
             unzip \
-            zip \
+            zip
+
+      - name: 📦 Instalacja podstawowych narzędzi (part 2)
+        run: |
+          # Druga partia pakietów
+          sudo apt-get install -y \
             tmux \
             screen \
             vim \
-            nano
+            nano \
+            ufw \
+            fail2ban \
+            build-essential
+
+      - name: 📦 Instalacja Dockera (bez konfliktów)
+        run: |
+          # Usuń stare wersje jeśli istnieją
+          sudo apt-get remove -y docker docker-engine docker.io containerd runc || true
+          
+          # Instalacja z oficjalnego repozytorium
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          sudo chmod a+r /etc/apt/keyrings/docker.gpg
+          
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+            $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          
+          sudo apt-get update
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          
+          # Symbolic link dla docker-compose
+          sudo ln -sf /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+
+      - name: 📦 Instalacja Nginx i Node.js
+        run: |
+          # Instalacja Nginx
+          sudo apt-get install -y nginx
+          
+          # Instalacja Node.js 20 LTS
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+          
+          # Instalacja dodatkowych narzędzi
+          sudo npm install -g npm@latest pm2 yarn
 
       - name: 🔧 Konfiguracja SSH
         run: |
@@ -54,12 +101,10 @@ jobs:
           sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
           
           # Konfiguracja SSH
-          sudo sed -i 's/#Port 22/Port ${{ github.event.inputs.ssh_port }}/' /etc/ssh/sshd_config
-          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
-          sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/#MaxAuthTries 6/MaxAuthTries 3/' /etc/ssh/sshd_config
-          sudo sed -i 's/#ClientAliveInterval 0/ClientAliveInterval 300/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#Port 22/Port ${{ github.event.inputs.ssh_port }}/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           
           # Restart SSH
           sudo systemctl restart sshd
@@ -68,12 +113,15 @@ jobs:
         run: |
           USERNAME="${{ github.event.inputs.username }}"
           
-          # Generuj losowe hasło (24 znaki)
-          PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-24)
+          # Generuj losowe hasło
+          PASSWORD=$(openssl rand -base64 24 | tr -d "=+/" | head -c 16)
           
           # Tworzenie użytkownika
-          sudo useradd -m -s /bin/bash -G sudo,docker,adm $USERNAME
+          sudo useradd -m -s /bin/bash -G sudo $USERNAME 2>/dev/null || true
           echo "$USERNAME:$PASSWORD" | sudo chpasswd
+          
+          # Dodaj do grup
+          sudo usermod -aG docker,adm $USERNAME
           
           # Sudo bez hasła
           echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME
@@ -81,11 +129,8 @@ jobs:
           # Zapisz dane
           echo "VPS_USERNAME=$USERNAME" >> $GITHUB_ENV
           echo "VPS_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-          
-          # Info o haśle
-          echo "USER_CREATED=true" >> $GITHUB_ENV
 
-      - name: 🔑 Generowanie kluczy SSH (ED25519 - nowszy standard)
+      - name: 🔑 Generowanie kluczy SSH
         run: |
           USERNAME="${{ github.event.inputs.username }}"
           
@@ -93,116 +138,48 @@ jobs:
           sudo mkdir -p /home/$USERNAME/.ssh
           sudo chmod 700 /home/$USERNAME/.ssh
           
-          # Generowanie kluczy (ED25519 - szybszy i bezpieczniejszy niż RSA)
-          sudo ssh-keygen -t ed25519 -f /home/$USERNAME/.ssh/id_ed25519 -N "" -C "$USERNAME@ubuntu-24.04"
+          # Generowanie kluczy
+          sudo ssh-keygen -t ed25519 -f /home/$USERNAME/.ssh/id_ed25519 -N "" -C "$USERNAME@ubuntu-24.04" -q
           
-          # Dodanie klucza publicznego do autoryzowanych
+          # Autoryzacja
           sudo cp /home/$USERNAME/.ssh/id_ed25519.pub /home/$USERNAME/.ssh/authorized_keys
           sudo chmod 600 /home/$USERNAME/.ssh/authorized_keys
-          
-          # Uprawnienia
           sudo chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh
-          
-          # Info
-          echo "SSH_KEY_GENERATED=true" >> $GITHUB_ENV
 
-      - name: 🔥 Konfiguracja firewalla (UFW)
+      - name: 🔥 Konfiguracja firewalla
         run: |
-          # Reset i podstawowa konfiguracja
-          sudo ufw --force reset
+          # Reset UFW jeśli jest problem
+          sudo ufw --force reset || true
+          
+          # Podstawowa konfiguracja
           sudo ufw default deny incoming
           sudo ufw default allow outgoing
           
           # Otwórz porty
-          sudo ufw allow ${{ github.event.inputs.ssh_port }}/tcp comment 'SSH'
-          sudo ufw allow 80/tcp comment 'HTTP'
-          sudo ufw allow 443/tcp comment 'HTTPS'
-          sudo ufw allow 8080/tcp comment 'Alternatywny HTTP'
-          sudo ufw allow 3000/tcp comment 'Node.js'
-          sudo ufw allow 5000/tcp comment 'Python'
-          sudo ufw allow 19999/tcp comment 'Netdata'
+          sudo ufw allow ${{ github.event.inputs.ssh_port }}/tcp
+          sudo ufw allow 80/tcp
+          sudo ufw allow 443/tcp
           
           # Włącz UFW
-          sudo ufw --force enable
+          echo "y" | sudo ufw enable
           
           # Status
           sudo ufw status verbose
 
-      - name: 📁 Tworzenie struktury katalogów
+      - name: 📁 Tworzenie katalogów
         run: |
           USERNAME="${{ github.event.inputs.username }}"
           
-          # Główne katalogi
-          sudo mkdir -p /var/www/{html,apps,logs}
-          sudo mkdir -p /opt/{scripts,backups}
-          sudo mkdir -p /backups/{daily,weekly}
-          
-          # Uprawnienia
-          sudo chown -R $USERNAME:$USERNAME /var/www
-          sudo chown -R $USERNAME:$USERNAME /opt
-          sudo chown -R $USERNAME:$USERNAME /backups
-          
-          # Symlinki
-          sudo ln -s /var/www /home/$USERNAME/www
-          sudo ln -s /opt /home/$USERNAME/opt
-
-      - name: 🐳 Konfiguracja Dockera
-        run: |
-          USERNAME="${{ github.event.inputs.username }}"
-          
-          # Dodaj użytkownika do grupy docker
-          sudo usermod -aG docker $USERNAME
-          
-          # Konfiguracja Dockera
-          sudo mkdir -p /etc/docker
-          cat << EOF | sudo tee /etc/docker/daemon.json
-          {
-            "log-driver": "json-file",
-            "log-opts": {
-              "max-size": "10m",
-              "max-file": "3"
-            },
-            "storage-driver": "overlay2",
-            "features": {
-              "buildkit": true
-            }
-          }
-          EOF
-          
-          # Restart Dockera
-          sudo systemctl restart docker
-          sudo systemctl enable docker
-
-      - name: 🌐 Konfiguracja Nginx
-        run: |
-          # Testowa strona
           sudo mkdir -p /var/www/html
-          cat << EOF | sudo tee /var/www/html/index.html
-          <!DOCTYPE html>
-          <html>
-          <head>
-              <title>Ubuntu 24.04 VPS</title>
-              <meta charset="UTF-8">
-              <style>
-                  body { font-family: Arial; text-align: center; padding: 50px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
-                  h1 { font-size: 50px; }
-                  .info { background: rgba(255,255,255,0.1); padding: 20px; border-radius: 10px; margin: 20px; }
-              </style>
-          </head>
-          <body>
-              <h1>🚀 Ubuntu 24.04 LTS VPS</h1>
-              <div class="info">
-                  <p>Serwer działa poprawnie!</p>
-                  <p>Tailsecale IP: <strong>$(tailscale ip -4 2>/dev/null || echo 'Oczekiwanie...')</strong></p>
-                  <p>Data: $(date)</p>
-              </div>
-          </body>
-          </html>
-          EOF
+          sudo mkdir -p /opt/scripts
+          sudo mkdir -p /backups
           
-          # Włącz stronę
-          sudo systemctl restart nginx
-          sudo systemctl enable nginx
+          sudo chown -R $USERNAME:$USERNAME /var/www 2>/dev/null || true
+          sudo chown -R $USERNAME:$USERNAME /opt 2>/dev/null || true
+          sudo chown -R $USERNAME:$USERNAME /backups 2>/dev/null || true
+          
+          # Testowa strona
+          echo "<h1>Ubuntu 24.04 VPS Działa!</h1>" | sudo tee /var/www/html/index.html
 
       - name: 📦 Instalacja Tailscale
         run: |
@@ -212,46 +189,34 @@ jobs:
           # Podłączenie do Tailscale
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --hostname=ubuntu-24-04-${{ github.run_id }} \
-            --advertise-tags=tag:github-runner
+            --accept-routes \
+            --accept-dns=false
           
           # Czekaj na IP
-          echo "Oczekiwanie na Tailscale IP..."
-          for i in {1..10}; do
+          for i in {1..15}; do
             TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "")
             if [ -n "$TAILSCALE_IP" ]; then
-              echo "Tailscale IP: $TAILSCALE_IP"
               echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+              echo "✅ Tailscale IP: $TAILSCALE_IP"
               break
             fi
-            echo "Próba $i/10..."
+            echo "Oczekiwanie na Tailscale IP... ($i/15)"
             sleep 5
           done
 
-      - name: 📊 Instalacja Netdata (monitoring)
-        run: |
-          # Instalacja Netdata
-          wget -O /tmp/netdata-kickstart.sh https://my-netdata.io/kickstart.sh
-          sh /tmp/netdata-kickstart.sh --stable-channel --disable-telemetry
-          
-          # Konfiguracja
-          sudo systemctl enable netdata
-          sudo systemctl start netdata
-
       - name: 📋 Wyświetl dane dostępowe
         run: |
-          PUBLIC_IP=$(curl -s ifconfig.me)
-          LOCAL_IP=$(hostname -I | awk '{print $1}')
+          PUBLIC_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || echo "Nieznany")
           
           echo "================================================"
-          echo "    🚀 UBUNTU 24.04 LTS PRZEZ TAILSCALE       "
+          echo "    🚀 UBUNTU 24.04 LTS GOTOWY                "
           echo "================================================"
           echo ""
           echo "📌 DANE SERWERA:"
           echo "──────────────────"
-          echo "🖥️  System: Ubuntu 24.04 LTS (Noble Numbat)"
+          echo "🖥️  System: Ubuntu 24.04 LTS"
           echo "🔗 Tailscale IP: ${{ env.TAILSCALE_IP }}"
           echo "🌐 Publiczny IP: $PUBLIC_IP"
-          echo "🏠 Lokalny IP: $LOCAL_IP"
           echo ""
           echo "👤 DANE UŻYTKOWNIKA:"
           echo "──────────────────"
@@ -261,66 +226,25 @@ jobs:
           echo ""
           echo "🔧 KOMENDY DO POŁĄCZENIA:"
           echo "──────────────────"
-          echo "📡 PRZEZ TAILSCALE (ZALECANE - bezpieczne):"
+          echo "📡 PRZEZ TAILSCALE:"
           echo "   ssh ${{ env.VPS_USERNAME }}@${{ env.TAILSCALE_IP }} -p ${{ github.event.inputs.ssh_port }}"
           echo ""
-          echo "🌍 PRZEZ PUBLICZNY IP:"
-          echo "   ssh ${{ env.VPS_USERNAME }}@$PUBLIC_IP -p ${{ github.event.inputs.ssh_port }}"
-          echo ""
-          echo "🔑 KLUCZ PRYWATNY SSH (ED25519):"
-          echo "────────────────────────────────"
-          echo "----- BEGIN ED25519 PRIVATE KEY -----"
+          echo "🔑 KLUCZ PRYWATNY SSH:"
+          echo "──────────────────────"
           sudo cat /home/${{ env.VPS_USERNAME }}/.ssh/id_ed25519
-          echo "----- END ED25519 PRIVATE KEY -----"
           echo ""
-          echo "🌐 DOSTĘP PRZEZ PRZEGLĄDARKĘ:"
-          echo "──────────────────"
-          echo "• Strona testowa: http://$PUBLIC_IP"
-          echo "• Netdata monitoring: http://$PUBLIC_IP:19999"
-          echo "• Przez Tailscale: http://${{ env.TAILSCALE_IP }}:19999"
-          echo ""
-          echo "📦 ZAINSTALOWANE PAKIETY:"
-          echo "──────────────────"
-          echo "✓ Docker + Docker Compose"
-          echo "✓ Nginx (port 80, 443)"
-          echo "✓ Node.js + npm"
-          echo "✓ UFW Firewall"
-          echo "✓ Fail2ban"
-          echo "✓ Netdata Monitoring"
-          echo "✓ Tailscale VPN"
-          echo ""
-          echo "⚠️  WAŻNE: Przy pierwszym logowaniu zmień hasło!"
-          echo "   Komenda: passwd"
-          echo ""
-          echo "================================================"
-          echo "✅ VPS gotowy do pracy przez 60 godzin!"
           echo "================================================"
 
       - name: 🔄 Utrzymywanie połączenia
         run: |
-          PUBLIC_IP=$(curl -s ifconfig.me)
-          
-          echo ""
-          echo "⏳ Serwer będzie aktywny przez 60 godzin"
+          echo "⏳ Serwer aktywny przez 60 godzin"
           echo ""
           
-          COUNTER=0
           while true; do
-            COUNTER=$((COUNTER + 1))
-            UPTIME=$(uptime | awk '{print $3}' | tr -d ',')
-            
-            echo "[$(date)] ✅ Ubuntu 24.04 LTS | Uptime: $UPTIME | Licznik: $COUNTER"
-            echo "   Tailscale IP: ${{ env.TAILSCALE_IP }}"
-            echo "   ssh ${{ env.VPS_USERNAME }}@${{ env.TAILSCALE_IP }} -p ${{ github.event.inputs.ssh_port }}"
+            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "${{ env.TAILSCALE_IP }}")
+            echo "[$(date)] ✅ Ubuntu 24.04 | Tailscale: $TAILSCALE_IP"
+            echo "   ssh ${{ env.VPS_USERNAME }}@$TAILSCALE_IP -p ${{ github.event.inputs.ssh_port }}"
             echo "   Hasło: ${{ env.VPS_PASSWORD }}"
-            echo "   Netdata: http://${{ env.TAILSCALE_IP }}:19999"
             echo "   ---"
-            
-            # Test połączenia Tailscale co 15 minut
-            if [ $((COUNTER % 3)) -eq 0 ]; then
-              CURRENT_IP=$(tailscale ip -4 2>/dev/null || echo "Brak")
-              echo "   ✅ Tailscale status: $CURRENT_IP"
-            fi
-            
-            sleep 300  # 5 minut
+            sleep 300
           done
