@@ -1,0 +1,346 @@
+name: 🚀 VPS Ubuntu Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: 'Nazwa użytkownika'
+        required: false
+        default: 'ubuntu'
+      password:
+        description: 'Hasło (opcjonalnie - jeśli puste, wygeneruje losowe)'
+        required: false
+        type: string
+      ssh_port:
+        description: 'Port SSH'
+        required: false
+        default: '22'
+
+jobs:
+  setup-ubuntu-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: 📦 Instalacja podstawowych narzędzi
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            openssh-server \
+            net-tools \
+            curl \
+            wget \
+            git \
+            htop \
+            neofetch \
+            ufw \
+            fail2ban \
+            docker.io \
+            docker-compose \
+            nodejs \
+            npm \
+            python3 \
+            python3-pip \
+            build-essential \
+            nginx \
+            mysql-server \
+            redis-server \
+            certbot \
+            python3-certbot-nginx
+
+      - name: 🔧 Konfiguracja SSH
+        run: |
+          # Backup oryginalnej konfiguracji
+          sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+          
+          # Konfiguracja SSH dla bezpieczeństwa
+          sudo sed -i 's/#Port 22/Port ${{ github.event.inputs.ssh_port }}/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#MaxAuthTries 6/MaxAuthTries 3/' /etc/ssh/sshd_config
+          sudo sed -i 's/#ClientAliveInterval 0/ClientAliveInterval 300/' /etc/ssh/sshd_config
+          sudo sed -i 's/#ClientAliveCountMax 3/ClientAliveCountMax 2/' /etc/ssh/sshd_config
+          
+          # Restart SSH
+          sudo systemctl restart sshd
+
+      - name: 👤 Tworzenie użytkownika
+        run: |
+          USERNAME="${{ github.event.inputs.username }}"
+          
+          # Generuj losowe hasło jeśli nie podano
+          if [[ -z "${{ github.event.inputs.password }}" ]]; then
+            PASSWORD=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-20)
+          else
+            PASSWORD="${{ github.event.inputs.password }}"
+          fi
+          
+          # Tworzenie użytkownika
+          sudo useradd -m -s /bin/bash -G sudo,docker,adm $USERNAME
+          echo "$USERNAME:$PASSWORD" | sudo chpasswd
+          
+          # Wymuś zmianę hasła przy pierwszym logowaniu
+          sudo chage -d 0 $USERNAME
+          
+          # Konfiguracja sudo bez hasła
+          echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$USERNAME
+          
+          # Zapisz dane
+          echo "VPS_USERNAME=$USERNAME" >> $GITHUB_ENV
+          echo "VPS_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+
+      - name: 🔑 Konfiguracja kluczy SSH
+        run: |
+          USERNAME="${{ github.event.inputs.username }}"
+          
+          # Tworzenie katalogu .ssh
+          sudo mkdir -p /home/$USERNAME/.ssh
+          sudo chmod 700 /home/$USERNAME/.ssh
+          
+          # Generowanie kluczy SSH dla użytkownika
+          sudo ssh-keygen -t rsa -b 4096 -f /home/$USERNAME/.ssh/id_rsa -N "" -C "$USERNAME@vps"
+          sudo ssh-keygen -t ed25519 -f /home/$USERNAME/.ssh/id_ed25519 -N "" -C "$USERNAME@vps"
+          
+          # Dodanie klucza publicznego do autoryzowanych
+          sudo cp /home/$USERNAME/.ssh/id_rsa.pub /home/$USERNAME/.ssh/authorized_keys
+          sudo chmod 600 /home/$USERNAME/.ssh/authorized_keys
+          
+          # Uprawnienia
+          sudo chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh
+          
+          # Wyświetl klucz prywatny
+          echo "### 🔑 KLUCZ PRYWATNY RSA ###"
+          sudo cat /home/$USERNAME/.ssh/id_rsa
+
+      - name: 🔥 Konfiguracja firewalla
+        run: |
+          # Podstawowa konfiguracja UFW
+          sudo ufw --force enable
+          sudo ufw default deny incoming
+          sudo ufw default allow outgoing
+          
+          # Otwórz porty
+          sudo ufw allow ${{ github.event.inputs.ssh_port }}/tcp comment 'SSH'
+          sudo ufw allow 80/tcp comment 'HTTP'
+          sudo ufw allow 443/tcp comment 'HTTPS'
+          sudo ufw allow 8080/tcp comment 'Alternatywny HTTP'
+          sudo ufw allow 3000/tcp comment 'Node.js'
+          sudo ufw allow 5000/tcp comment 'Python/Flask'
+          
+          sudo ufw status verbose
+
+      - name: 📁 Tworzenie struktury katalogów
+        run: |
+          USERNAME="${{ github.event.inputs.username }}"
+          
+          sudo mkdir -p /var/www/{html,staging,logs}
+          sudo mkdir -p /opt/{applications,scripts,backups}
+          sudo mkdir -p /data/{mysql,redis,uploads}
+          sudo mkdir -p /backups/{daily,weekly,monthly}
+          
+          sudo chown -R $USERNAME:$USERNAME /var/www
+          sudo chown -R $USERNAME:$USERNAME /opt
+          sudo chown -R $USERNAME:$USERNAME /data
+          sudo chown -R $USERNAME:$USERNAME /backups
+          
+          sudo ln -s /var/www /home/$USERNAME/www
+          sudo ln -s /opt /home/$USERNAME/opt
+          sudo chown -R $USERNAME:$USERNAME /home/$USERNAME
+
+      - name: 🐳 Konfiguracja Dockera
+        run: |
+          USERNAME="${{ github.event.inputs.username }}"
+          
+          sudo usermod -aG docker $USERNAME
+          
+          sudo mkdir -p /etc/docker
+          cat << EOF | sudo tee /etc/docker/daemon.json
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            },
+            "storage-driver": "overlay2"
+          }
+          EOF
+          
+          sudo systemctl restart docker
+          sudo systemctl enable docker
+
+      - name: 🌐 Konfiguracja Nginx
+        run: |
+          sudo cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
+          
+          cat << EOF | sudo tee /etc/nginx/nginx.conf
+          user www-data;
+          worker_processes auto;
+          pid /run/nginx.pid;
+          
+          events {
+            worker_connections 1024;
+            multi_accept on;
+            use epoll;
+          }
+          
+          http {
+            sendfile on;
+            tcp_nopush on;
+            tcp_nodelay on;
+            keepalive_timeout 65;
+            types_hash_max_size 2048;
+            server_tokens off;
+            
+            include /etc/nginx/mime.types;
+            default_type application/octet-stream;
+            
+            access_log /var/log/nginx/access.log;
+            error_log /var/log/nginx/error.log;
+            
+            gzip on;
+            gzip_vary on;
+            gzip_proxied any;
+            gzip_comp_level 6;
+            gzip_types text/plain text/css text/xml application/json application/javascript application/xml+rss application/atom+xml image/svg+xml;
+            
+            include /etc/nginx/conf.d/*.conf;
+            include /etc/nginx/sites-enabled/*;
+          }
+          EOF
+          
+          sudo nginx -t
+          sudo systemctl restart nginx
+          sudo systemctl enable nginx
+
+      - name: 🗄️ Konfiguracja MySQL
+        run: |
+          sudo mysql << EOF
+          ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${{ env.VPS_PASSWORD }}';
+          DELETE FROM mysql.user WHERE User='';
+          DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+          DROP DATABASE IF EXISTS test;
+          DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+          FLUSH PRIVILEGES;
+          EOF
+          
+          sudo mysql -u root -p${{ env.VPS_PASSWORD }} << EOF
+          CREATE DATABASE IF NOT EXISTS app_database;
+          CREATE USER IF NOT EXISTS 'app_user'@'localhost' IDENTIFIED BY '${{ env.VPS_PASSWORD }}';
+          GRANT ALL PRIVILEGES ON app_database.* TO 'app_user'@'localhost';
+          FLUSH PRIVILEGES;
+          EOF
+          
+          sudo cp /etc/mysql/mysql.conf.d/mysqld.cnf /etc/mysql/mysql.conf.d/mysqld.cnf.backup
+          
+          cat << EOF | sudo tee /etc/mysql/mysql.conf.d/mysqld.cnf
+          [mysqld]
+          user = mysql
+          pid-file = /var/run/mysqld/mysqld.pid
+          socket = /var/run/mysqld/mysqld.sock
+          port = 3306
+          basedir = /usr
+          datadir = /var/lib/mysql
+          tmpdir = /tmp
+          lc-messages-dir = /usr/share/mysql
+          skip-external-locking
+          bind-address = 127.0.0.1
+          key_buffer_size = 16M
+          max_allowed_packet = 16M
+          thread_stack = 192K
+          thread_cache_size = 8
+          myisam-recover-options = BACKUP
+          query_cache_limit = 1M
+          query_cache_size = 16M
+          log_error = /var/log/mysql/error.log
+          expire_logs_days = 10
+          max_binlog_size = 100M
+          EOF
+          
+          sudo systemctl restart mysql
+
+      - name: 📊 Monitoring i narzędzia
+        run: |
+          sudo apt-get install -y \
+            prometheus-node-exporter \
+            grafana \
+            netdata \
+            glances \
+            nmon \
+            iotop \
+            iftop \
+            nethogs
+          
+          sudo systemctl enable netdata
+          sudo systemctl start netdata
+          
+          cat << EOF | sudo tee /etc/cron.d/backup
+          0 2 * * * root tar -czf /backups/daily/www-\$(date +\%Y\%m\%d).tar.gz /var/www
+          0 2 * * * root mysqldump --all-databases -u root -p${{ env.VPS_PASSWORD }} > /backups/daily/mysql-\$(date +\%Y\%m\%d).sql
+          0 3 * * * root find /backups/daily -type f -mtime +7 -delete
+          0 3 * * 0 root find /backups/weekly -type f -mtime +30 -delete
+          EOF
+
+      - name: 🌍 Konfiguracja sieci
+        run: |
+          cat << EOF | sudo tee -a /etc/sysctl.conf
+          net.core.rmem_max = 134217728
+          net.core.wmem_max = 134217728
+          net.ipv4.tcp_rmem = 4096 87380 134217728
+          net.ipv4.tcp_wmem = 4096 65536 134217728
+          net.core.netdev_max_backlog = 5000
+          net.ipv4.tcp_congestion_control = bbr
+          net.core.default_qdisc = fq
+          net.ipv4.tcp_notsent_lowat = 16384
+          net.ipv4.tcp_slow_start_after_idle = 0
+          EOF
+          
+          sudo sysctl -p
+
+      - name: 📋 Wyświetl dane dostępowe
+        run: |
+          PUBLIC_IP=$(curl -s ifconfig.me)
+          LOCAL_IP=$(hostname -I | awk '{print $1}')
+          
+          echo "========================================="
+          echo "    🚀 VPS UBUNTU GOTOWY DO PRACY     "
+          echo "========================================="
+          echo ""
+          echo "📌 DANE DOSTĘPOWE:"
+          echo "──────────────────"
+          echo "🌐 Publiczny IP: $PUBLIC_IP"
+          echo "🏠 Lokalny IP: $LOCAL_IP"
+          echo "👤 Użytkownik: ${{ env.VPS_USERNAME }}"
+          echo "🔑 Hasło: ${{ env.VPS_PASSWORD }}"
+          echo "🔌 Port SSH: ${{ github.event.inputs.ssh_port }}"
+          echo ""
+          echo "🔧 KOMENDY DO POŁĄCZENIA:"
+          echo "──────────────────"
+          echo "ssh ${{ env.VPS_USERNAME }}@$PUBLIC_IP -p ${{ github.event.inputs.ssh_port }}"
+          echo ""
+          echo "🔑 KLUCZ PRYWATNY SSH:"
+          echo "──────────────────"
+          sudo cat /home/${{ env.VPS_USERNAME }}/.ssh/id_rsa
+          echo ""
+          echo "📊 Monitoring:"
+          echo "──────────────────"
+          echo "• Netdata: http://$PUBLIC_IP:19999"
+          echo "• Grafana: http://$PUBLIC_IP:3000"
+          echo ""
+          echo "========================================="
+
+      - name: 🔄 Utrzymywanie połączenia
+        run: |
+          PUBLIC_IP=$(curl -s ifconfig.me)
+          echo ""
+          echo "✅ VPS Ubuntu skonfigurowany pomyślnie!"
+          echo "⏳ Serwer będzie aktywny przez 60 godzin"
+          echo ""
+          
+          while true; do
+            echo "[$(date)] ✅ VPS Ubuntu aktywny"
+            echo "   Połącz się przez: ssh ${{ env.VPS_USERNAME }}@$PUBLIC_IP -p ${{ github.event.inputs.ssh_port }}"
+            echo "   Użyj hasła: ${{ env.VPS_PASSWORD }}"
+            echo "   ---"
+            sleep 300
+          done
